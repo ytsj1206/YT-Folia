@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: YT <yt@localhost>
+Date: Mon, 5 Oct 2026 22:40:31 +0800
+Subject: [PATCH] Fix server GUI tick time and TPS with region threading
+
+diff --git a/src/main/java/com/destroystokyo/paper/gui/RAMDetails.java b/src/main/java/com/destroystokyo/paper/gui/RAMDetails.java
+index 9863aed2417e494c44275ba2bb378f641c6e75a4..244da5fad5a69432af8c717e5b5770487c3e1725 100644
+--- a/src/main/java/com/destroystokyo/paper/gui/RAMDetails.java
++++ b/src/main/java/com/destroystokyo/paper/gui/RAMDetails.java
+@@ -1,8 +1,16 @@
+ package com.destroystokyo.paper.gui;
+ 
++import io.papermc.paper.threadedregions.RegionizedServer;
++import io.papermc.paper.threadedregions.TickRegionScheduler;
++import io.papermc.paper.threadedregions.TickRegions;
++import io.papermc.paper.threadedregions.ThreadedRegionizer;
++import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.util.Util;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.util.TimeUtil;
++import org.bukkit.Bukkit;
++import org.bukkit.World;
++import org.bukkit.craftbukkit.CraftWorld;
+ 
+ import javax.swing.DefaultListCellRenderer;
+ import javax.swing.DefaultListSelectionModel;
+@@ -11,8 +19,11 @@ import javax.swing.border.EmptyBorder;
+ import java.awt.Dimension;
+ import java.text.DecimalFormat;
+ import java.text.DecimalFormatSymbols;
++import java.util.ArrayList;
++import java.util.List;
+ import java.util.Locale;
+ import java.util.Vector;
++import java.util.concurrent.TimeUnit;
+ 
+ public class RAMDetails extends JList<String> {
+     public static final DecimalFormat DECIMAL_FORMAT = Util.make(new DecimalFormat("########0.000"), (format)
+@@ -20,6 +31,11 @@ public class RAMDetails extends JList<String> {
+ 
+     private final MinecraftServer server;
+ 
++    // Folia start - the 1m/5m/15m reports walk a lot of samples, so they are only rebuilt every few seconds
++    private double[] cachedTps;
++    private long cachedTpsTime;
++    // Folia end
++
+     public RAMDetails(MinecraftServer server) {
+         this.server = server;
+ 
+@@ -59,8 +75,77 @@ public class RAMDetails extends JList<String> {
+         GraphData data = RAMGraph.DATA.peekLast();
+         Vector<String> vector = new Vector<>();
+ 
+-        // Follows CraftServer#getTPS
+-        double[] tps = server.getTPS();
++        // Folia start - with region threading the vanilla tick time tracking and MinecraftServer#recordEndOfTick
++        // are not used, so the values this used to read are always zero/empty. Read the tick data of every region
++        // (plus the global region) the same way the /tps command does.
++        double mspt = (double) this.server.getAverageTickTimeNanos() / (double) TimeUtil.NANOSECONDS_PER_MILLISECOND;
++        double worstMspt = mspt;
++        double[] tps = this.server.getTPS();
++
++        try {
++            final long currTime = System.nanoTime();
++            final List<TickRegionScheduler.RegionScheduleHandle> handles = new ArrayList<>();
++            handles.add(RegionizedServer.getGlobalTickData());
++
++            final List<ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData>> regions = new ArrayList<>();
++            for (final World bukkitWorld : Bukkit.getWorlds()) {
++                final ServerLevel level = ((CraftWorld) bukkitWorld).getHandle();
++                level.regioniser.computeForAllRegions(regions::add);
++            }
++            for (final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region : regions) {
++                handles.add(region.getData().getRegionSchedulingHandle());
++            }
++
++            double msptSum = 0.0;
++            int msptCount = 0;
++            for (final TickRegionScheduler.RegionScheduleHandle handle : handles) {
++                final ca.spottedleaf.moonrise.common.time.TickData.TickReportData report = handle.getTickReport5s(currTime);
++                if (report == null) {
++                    continue;
++                }
++                final double regionMspt = report.timePerTickData().segmentAll().average() / 1.0E6;
++                if (Double.isNaN(regionMspt)) {
++                    continue;
++                }
++                msptSum += regionMspt;
++                worstMspt = Math.max(worstMspt, regionMspt);
++                msptCount++;
++            }
++            if (msptCount > 0) {
++                mspt = msptSum / (double) msptCount;
++            }
++
++            if (this.cachedTps == null || (currTime - this.cachedTpsTime) > TimeUnit.SECONDS.toNanos(5L)) {
++                final double[] tpsSum = new double[3];
++                final int[] tpsCount = new int[3];
++                for (final TickRegionScheduler.RegionScheduleHandle handle : handles) {
++                    accumulateTps(tpsSum, tpsCount, 0, handle.getTickReport1m(currTime));
++                    accumulateTps(tpsSum, tpsCount, 1, handle.getTickReport5m(currTime));
++                    accumulateTps(tpsSum, tpsCount, 2, handle.getTickReport15m(currTime));
++                }
++                final double[] regionTps = new double[3];
++                boolean any = false;
++                for (int i = 0; i < 3; i++) {
++                    if (tpsCount[i] > 0) {
++                        regionTps[i] = tpsSum[i] / (double) tpsCount[i];
++                        any = true;
++                    } else {
++                        regionTps[i] = tps[i];
++                    }
++                }
++                if (any) {
++                    this.cachedTps = regionTps;
++                    this.cachedTpsTime = currTime;
++                }
++            }
++            if (this.cachedTps != null) {
++                tps = this.cachedTps;
++            }
++        } catch (Throwable ex) {
++            // region tick data is read across threads, so a race is possible; keep the previous values then
++        }
++        // Folia end
++
+         String[] tpsAvg = new String[tps.length];
+ 
+         for ( int g = 0; g < tps.length; g++) {
+@@ -68,11 +153,25 @@ public class RAMDetails extends JList<String> {
+         }
+         vector.add("Memory use: " + (data.getUsedMem() / 1024L / 1024L) + " mb (" + (data.getFree() * 100L / data.getMax()) + "% free)");
+         vector.add("Heap: " + (data.getTotal() / 1024L / 1024L) + " / " + (data.getMax() / 1024L / 1024L) + " mb");
+-        vector.add("Avg tick: " + DECIMAL_FORMAT.format((double)this.server.getAverageTickTimeNanos() / (double) TimeUtil.NANOSECONDS_PER_MILLISECOND) + " ms");
++        vector.add("Avg tick: " + DECIMAL_FORMAT.format(mspt) + " ms" + (worstMspt > mspt ? " (worst " + DECIMAL_FORMAT.format(worstMspt) + " ms)" : ""));
+         vector.add("TPS from last 1m, 5m, 15m: " + String.join(", ", tpsAvg));
+         setListData(vector);
+     }
+ 
++    // Folia start - helper for the per region TPS average
++    private static void accumulateTps(final double[] sum, final int[] count, final int index, final ca.spottedleaf.moonrise.common.time.TickData.TickReportData report) {
++        if (report == null) {
++            return;
++        }
++        final double tps = report.tpsData().segmentAll().average();
++        if (Double.isNaN(tps)) {
++            return;
++        }
++        sum[index] += tps;
++        count[index]++;
++    }
++    // Folia end
++
+     private static String format(double tps) {
+         return ( ( tps > 21.0 ) ? "*" : "" ) + Math.min( Math.round( tps * 100.0 ) / 100.0, 20.0 );
+     }
