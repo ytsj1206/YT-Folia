@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: YT <yt@localhost>
+Date: Mon, 5 Oct 2026 19:49:40 +0800
+Subject: [PATCH] Fix server GUI player list never refreshing
+
+diff --git a/net/minecraft/server/gui/MinecraftServerGui.java b/net/minecraft/server/gui/MinecraftServerGui.java
+index f262a7c5ae4e7d56f16f5c0f4f145a2e428abbe4..bfc7c8ce14f6539d50c46728254b3544c20ca271 100644
+--- a/net/minecraft/server/gui/MinecraftServerGui.java
++++ b/net/minecraft/server/gui/MinecraftServerGui.java
+@@ -14,7 +14,6 @@ import java.util.Collection;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import javax.swing.JComponent;
+ import javax.swing.JFrame;
+-import javax.swing.JList;
+ import javax.swing.JPanel;
+ import javax.swing.JScrollBar;
+ import javax.swing.JScrollPane;
+@@ -104,7 +103,8 @@ public class MinecraftServerGui extends JComponent {
+     }
+ 
+     private JComponent buildPlayerPanel() {
+-        JList<?> jList = new PlayerListComponent(this.server);
++        PlayerListComponent jList = new PlayerListComponent(this.server); // Folia - typed so the refresh timer can be stopped
++        this.finalizers.add(jList::close); // Folia - the player list is refreshed by a Swing timer
+         JScrollPane jScrollPane = new JScrollPane(jList, 22, 30);
+         jScrollPane.setBorder(new TitledBorder(new EtchedBorder(), "Players"));
+         return jScrollPane;
+diff --git a/net/minecraft/server/gui/PlayerListComponent.java b/net/minecraft/server/gui/PlayerListComponent.java
+index 5a8cd3e6b448a4472092690cf589bca10b142126..7374b5eacea264d5cbb5d974f6a19912fe8a4727 100644
+--- a/net/minecraft/server/gui/PlayerListComponent.java
++++ b/net/minecraft/server/gui/PlayerListComponent.java
+@@ -2,26 +2,44 @@ package net.minecraft.server.gui;
+ 
+ import java.util.Vector;
+ import javax.swing.JList;
++import javax.swing.Timer;
+ import net.minecraft.server.MinecraftServer;
+ 
+ public class PlayerListComponent extends JList<String> {
+     private final MinecraftServer server;
+-    private int tickCount;
++    private final Timer timer; // Folia - this list is refreshed by a Swing timer, see below
+ 
+     public PlayerListComponent(MinecraftServer server) {
+         this.server = server;
+-        server.addTickable(this::tick);
++        // Folia start - MinecraftServer#tick does not drain the tickables list any more, so the vanilla
++        // server.addTickable(this::tick) call would never run and the Players panel would stay empty forever.
++        // Refresh from a Swing timer instead, exactly like StatsComponent does; the callback runs on the EDT,
++        // so setListData is called on the correct thread.
++        this.timer = new Timer(1000, actionEvent -> this.tick()); // vanilla refreshed every 20 ticks == 1000ms
++        this.timer.start();
++        // Folia end
+     }
+ 
+     public void tick() {
+-        if (this.tickCount++ % 20 == 0) {
+-            Vector<String> list = new Vector<>();
++        // Folia start - getPlayers() returns a live list and players may join or leave on other region
++        // threads, so take a snapshot and simply retry on the next tick if that races.
++        Vector<String> list = new Vector<>();
+ 
++        try {
+             for (int i = 0; i < this.server.getPlayerList().getPlayers().size(); i++) {
+                 list.add(this.server.getPlayerList().getPlayers().get(i).getGameProfile().name());
+             }
+-
+-            this.setListData(list);
++        } catch (Throwable ex) {
++            return;
+         }
++
++        this.setListData(list);
++        // Folia end
++    }
++
++    // Folia start - stop the timer once the window is closed
++    public void close() {
++        this.timer.stop();
+     }
++    // Folia end
+ }
