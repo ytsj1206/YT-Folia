@@ -10,3 +10,6 @@
 # Binary files should be left untouched
 *.jar           binary
 
+# Patch files must keep lf, paperweight applies them with git apply
+*.patch         text eol=lf
+
