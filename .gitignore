@@ -13,4 +13,7 @@ build
 /paper-api
 /paper-api-generator
 
+# 本地编译产物输出目录（本项目约定，不提交）
+/编译产物
+
 .idea/
